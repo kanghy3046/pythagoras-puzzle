@@ -415,7 +415,8 @@ const board=$('board');
 
 let mode='practice';          // practice | challenge
 let lvIdx=0, L=null;
-let pieces=[], slots=[], slotOwner=[], slotSign=1;
+let pieces=[], slots=[], slotSign=1;
+let FRAME=[], targets=[], samplePts=[], geoEps={len:1e-3,area:1e-4};
 let phase='home';             // home | ready | count | play | clear | final
 let selected=null, drag=null, lastTap={pc:null,t:0};
 let hintCount=0, hintTimer=null, hintReadyAt=0, hintCooling=false;
@@ -560,8 +561,18 @@ function buildBoard(){
   T(`b² = ${L.b2}`, -q/2, -q/2, 'big', fs*1.15);
   T(`c² = ${L.c2}`, (p+q)/2, -(p+q)/2, 'big', fs*1.3);
 
-  slots=D.map(d=>d.dst); slotOwner=slots.map(()=>-1);
+  slots=D.map(d=>d.dst);
   slotSign=Math.sign(sgnArea(slots[0]));
+  // 정답은 하나가 아니다: c² 전체를 90°씩 돌린 배치도 정답이고, 다른 조합도 가능하다.
+  FRAME=[[p,0],[0,-q],[q,-p-q],[p+q,-p]];
+  geoEps={len:c*1e-3, area:c*c*1e-4};
+  const O=[(p+q)/2,-(p+q)/2];
+  const rotP=(P,k)=>P.map(([x,y])=>{let dx=x-O[0],dy=y-O[1];for(let r=0;r<k;r++)[dx,dy]=[-dy,dx];return [O[0]+dx,O[1]+dy];});
+  targets=[]; for(let k=0;k<4;k++) slots.forEach(s=>targets.push(rotP(s,k)));
+  // 힌트 탐색용 표본점: c² 안을 한 줄씩 훑는 순서
+  const N=Math.max(12,Math.ceil(c*2)), e1=[-p,-q], e2=[q,-p];
+  samplePts=[];
+  for(let a=0;a<N;a++)for(let b=0;b<N;b++){const s=(a+0.37)/N,t=(b+0.61)/N; samplePts.push([p+s*e1[0]+t*e2[0], s*e1[1]+t*e2[1]]);}
   if(L.guide) slots.forEach(s=>el('polygon',{points:pts(s),class:'slot'},layers.slots));
 
   const cnt={p:0,q:0};
@@ -571,8 +582,18 @@ function buildBoard(){
     const g=el('g',{class:'piece','data-i':i},layers.pieces);
     el('polygon',{points:pts(local),fill:color,class:'shape'},g);
     el('polygon',{points:pts(local),class:'hit'},g);       // 손가락으로 잡기 쉽게 테두리를 넓힘
-    const pc={i,kind:d.kind,color,local,home:C,cx:C[0],cy:C[1],ang:0,flip:false,slot:-1,g};
-    pc.compat=slots.map((s,j)=>{const f=fitPolys(d.src,s);return f&&f.resid<tol.resid?j:-1;}).filter(j=>j>=0);
+    const pc={i,kind:d.kind,color,local,home:C,cx:C[0],cy:C[1],ang:0,flip:false,placed:false,wv:null,g};
+    pc.area=Math.abs(sgnArea(local));
+    // 돌리기(90°)·뒤집기로 만들 수 있는 8가지 방향 (모양이 같은 방향은 하나만)
+    pc.orients=[];
+    for(const flip of [false,true]) for(let k=0;k<4;k++){
+      const V=placeVerts(local,0,0,k*90,flip);
+      const key=V.map(v=>v[0].toFixed(3)+','+v[1].toFixed(3)).sort().join('|');
+      if(!pc.orients.some(o=>o.key===key)) pc.orients.push({ang:k*90,flip,V,key});
+    }
+    pc.tgt=targets.filter(T=>{ if(T.length!==local.length) return false;
+      return pc.orients.some(o=>{let V=o.V; if(Math.sign(sgnArea(V))!==slotSign) V=V.slice().reverse();
+        const f=fitPolys(V,T); return f&&f.resid<tol.resid&&Math.abs(f.phi)<1e-3;}); });
     return pc;
   });
   selected=null;
@@ -582,7 +603,7 @@ function buildBoard(){
    단계에 따라 정사각형 하나를 통째로 90°씩 돌리거나 뒤집어 놓아서, 조각마다 돌리기/뒤집기가 필요해진다. */
 function scramble(){
   const {p,q}=L;
-  pieces.forEach(pc=>{pc.cx=pc.home[0];pc.cy=pc.home[1];pc.ang=0;pc.flip=false;pc.slot=-1;});
+  pieces.forEach(pc=>{pc.cx=pc.home[0];pc.cy=pc.home[1];pc.ang=0;pc.flip=false;pc.placed=false;pc.wv=null;});
   for(const kind of ['p','q']){
     const s=L.sym[kind]; if(s==='none') continue;
     const mir = s==='rotflip';
@@ -600,8 +621,7 @@ function scramble(){
   resetPieces();
 }
 function resetPieces(){
-  slotOwner=slots.map(()=>-1);
-  pieces.forEach(pc=>{ Object.assign(pc,pc.start); pc.slot=-1; pc.g.classList.remove('sel','pulse','pop'); applyTransform(pc); layers.pieces.appendChild(pc.g); });
+  pieces.forEach(pc=>{ Object.assign(pc,pc.start); pc.placed=false; pc.wv=null; pc.g.classList.remove('sel','pulse','pop'); applyTransform(pc); layers.pieces.appendChild(pc.g); });
   board.classList.remove('done');
   select(null); updateProgress();
 }
@@ -612,30 +632,51 @@ function resetPieces(){
 function applyTransform(pc){
   pc.g.setAttribute('transform',`translate(${pc.cx.toFixed(4)} ${pc.cy.toFixed(4)}) rotate(${pc.ang.toFixed(3)}) scale(${pc.flip?-1:1} 1)`);
 }
-function worldVerts(pc){
-  const a=pc.ang*Math.PI/180, cs=Math.cos(a), sn=Math.sin(a);
-  return pc.local.map(([x,y])=>{const xx=pc.flip?-x:x; return [pc.cx+xx*cs-y*sn, pc.cy+xx*sn+y*cs];});
+function placeVerts(local,cx,cy,ang,flip){
+  const a=ang*Math.PI/180, cs=Math.round(Math.cos(a)*1e12)/1e12, sn=Math.round(Math.sin(a)*1e12)/1e12;
+  return local.map(([x,y])=>{const xx=flip?-x:x; return [cx+xx*cs-y*sn, cy+xx*sn+y*cs];});
 }
-function release(pc){ if(pc.slot>=0){ slotOwner[pc.slot]=-1; pc.slot=-1; updateProgress(); } }
+function worldVerts(pc){ return placeVerts(pc.local,pc.cx,pc.cy,pc.ang,pc.flip); }
+function release(pc){ if(pc.placed){ pc.placed=false; pc.wv=null; updateProgress(); } }
+
+/* 맞춤 판정: 조각이 c² 안에 있고 이미 놓인 조각과 겹치지 않으면 '맞음'.
+   정해진 자리만이 아니라 다른 조합(돌린 배치, 바꿔 낀 배치)도 모두 인정한다. */
+function inFrame(W){
+  const sg=Math.sign(sgnArea(FRAME));
+  for(const v of W) for(let i=0;i<4;i++){
+    const A=FRAME[i],B=FRAME[(i+1)%4];
+    const d=sg*((B[0]-A[0])*(v[1]-A[1])-(B[1]-A[1])*(v[0]-A[0]))/Math.hypot(B[0]-A[0],B[1]-A[1]);
+    if(d<-geoEps.len) return false;
+  }
+  return true;
+}
+function overlapArea(A,B){ const P=clip(A,B); return P.length<3?0:Math.abs(sgnArea(P)); }
+function fitsAmong(W,others){
+  if(!inFrame(W)) return false;
+  for(const O of others) if(overlapArea(W,O)>geoEps.area) return false;
+  return true;
+}
+const shift=(V,tx,ty)=>V.map(v=>[v[0]+tx,v[1]+ty]);
+/* 지금 방향 그대로 놓을 수 있는 자리 후보: (1) 꼭짓점을 c² 모서리나 놓인 조각의 꼭짓점에 맞춘 자리
+   (2) 정답 배치(및 그것을 통째로 돌린 배치)의 같은 모양 자리 */
+function placeCands(V,tgt,others){
+  const out=[];
+  const anchors=FRAME.concat(...others);
+  for(const v of V) for(const a of anchors) out.push([a[0]-v[0],a[1]-v[1]]);
+  let Vs=V; if(Math.sign(sgnArea(Vs))!==slotSign) Vs=Vs.slice().reverse();
+  for(const T of tgt){ const f=fitPolys(Vs,T); if(f&&f.resid<geoEps.len*10&&Math.abs(f.phi)<1e-3) out.push([f.cW[0]-f.cV[0],f.cW[1]-f.cV[1]]); }
+  return out;
+}
 function trySnap(pc){
   if(phase!=='play') return false;
-  let V=worldVerts(pc);
-  if(Math.sign(sgnArea(V))!==slotSign) V=V.slice().reverse();
-  let best=null;
-  for(const j of pc.compat){
-    if(slotOwner[j]!==-1&&slotOwner[j]!==pc.i) continue;
-    const f=fitPolys(V,slots[j]);
-    if(!f||f.resid>tol.resid) continue;
-    const dist=Math.hypot(f.cV[0]-f.cW[0],f.cV[1]-f.cW[1]);
-    if(dist>tol.pos||Math.abs(f.phi)>tol.rot) continue;
-    if(!best||dist<best.dist) best={j,f,dist};
-  }
-  if(!best) return false;
-  const {f,j}=best, cs=Math.cos(f.phi), sn=Math.sin(f.phi);
-  const dx=pc.cx-f.cV[0], dy=pc.cy-f.cV[1];
-  pc.cx=f.cW[0]+cs*dx-sn*dy; pc.cy=f.cW[1]+sn*dx+cs*dy;
-  pc.ang=normAng(pc.ang+f.phi*180/Math.PI);
-  slotOwner[j]=pc.i; pc.slot=j;
+  const V=worldVerts(pc);
+  const others=pieces.filter(o=>o!==pc&&o.placed).map(o=>o.wv);
+  const cands=placeCands(V,pc.tgt,others)
+    .map(t=>({t,d:Math.hypot(t[0],t[1])})).filter(c=>c.d<tol.pos).sort((a,b)=>a.d-b.d);
+  const hit=cands.find(c=>fitsAmong(shift(V,c.t[0],c.t[1]),others));
+  if(!hit) return false;
+  pc.cx+=hit.t[0]; pc.cy+=hit.t[1];
+  pc.placed=true; pc.wv=worldVerts(pc);
   applyTransform(pc);
   pc.g.classList.remove('pop'); void pc.g.offsetWidth; pc.g.classList.add('pop');
   if(selected===pc) select(null);
@@ -684,7 +725,7 @@ board.addEventListener('pointerdown',e=>{
   const pc=pieces[+g.dataset.i];
   select(pc); layers.pieces.appendChild(g);
   const pt=toSvg(e);
-  drag={pc,dx:pc.cx-pt.x,dy:pc.cy-pt.y,id:e.pointerId,moved:false,sx:e.clientX,sy:e.clientY,wasSlot:pc.slot};
+  drag={pc,dx:pc.cx-pt.x,dy:pc.cy-pt.y,id:e.pointerId,moved:false,sx:e.clientX,sy:e.clientY};
   g.classList.add('dragging');
   try{board.setPointerCapture(e.pointerId);}catch(_){}
   e.preventDefault();
@@ -735,12 +776,13 @@ $('bHint').onclick=giveHint;
    진행 / 통과
    ===================================================================== */
 function updateProgress(){
-  const n=pieces.filter(p=>p.slot>=0).length;
+  const n=pieces.filter(p=>p.placed).length;
   const pre = mode==='challenge' ? `🏁 도전 ${lvIdx+1}/${LEVELS.length}단계 · ` : '연습 · ';
   $('lvSub').textContent = pieces.length ? `${pre}맞춘 조각 ${n} / ${pieces.length}` : '';
 }
 function checkWin(){
-  if(!(pieces.length&&pieces.every(p=>p.slot>=0))) return false;
+  // 모든 조각이 c² 안에 겹치지 않고 놓였고 넓이의 합이 c²이므로 빈틈없이 채워진 것
+  if(!(pieces.length&&pieces.every(p=>p.placed))) return false;
   levelDone(); return true;
 }
 function levelDone(){
@@ -829,18 +871,77 @@ $('btnSound').onclick=()=>{ soundOn=!soundOn; store.set('pyth-sound',soundOn); u
 /* =====================================================================
    힌트
    ===================================================================== */
+/* 지금 놓인 조각은 그대로 두고, 남은 조각으로 c²를 채우는 방법을 찾는다.
+   c² 안 표본점을 한 줄씩 훑어 아직 비어 있는 첫 점을 덮는 조각을 차례로 시도(되돌아가기 탐색). */
+function inConvex(P,pt){
+  const sg=Math.sign(sgnArea(P));
+  for(let i=0;i<P.length;i++){const A=P[i],B=P[(i+1)%P.length];
+    if(sg*((B[0]-A[0])*(pt[1]-A[1])-(B[1]-A[1])*(pt[0]-A[0]))<=1e-9) return false;}
+  return true;
+}
+/* 빠른 길: 지금 놓인 조각이 정답(또는 정답을 통째로 90°·180°·270° 돌린 배치)과 일치하면 바로 답을 만든다 */
+function solveByRotation(){
+  const n=slots.length, close=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1])<geoEps.len*10;
+  for(let k=0;k<4;k++){
+    const T=targets.slice(k*n,(k+1)*n), used=new Set(); let ok=true;
+    for(const o of pieces.filter(p=>p.placed)){
+      const j=T.findIndex((W,jj)=>!used.has(jj)&&o.tgt.includes(W)&&close(avg(W),avg(o.wv)));
+      if(j<0){ok=false;break;} used.add(j);
+    }
+    if(!ok) continue;
+    const sol=[];
+    for(const pc of pieces.filter(p=>!p.placed)){
+      const j=T.findIndex((W,jj)=>!used.has(jj)&&pc.tgt.includes(W));
+      if(j<0){ok=false;break;} used.add(j); sol.push({pc,W:T[j]});
+    }
+    if(ok) return sol;
+  }
+  return null;
+}
+function solveFrom(){
+  const fast=solveByRotation(); if(fast) return {sol:fast,timeout:false,ms:0};
+  const t0=performance.now(), memo=new Set(); let timeout=false;
+  const fixed=pieces.filter(o=>o.placed);
+  const rec=(Ws,ids,left)=>{
+    if(!left.length) return [];
+    if(performance.now()-t0>1500){ timeout=true; return null; }
+    const P=samplePts.find(pt=>!Ws.some(W=>inConvex(W,pt)));
+    if(!P) return null;
+    const key=ids.slice().sort().join(';');
+    if(memo.has(key)) return null;
+    for(const pc of left){
+      const seen=new Set();
+      for(const o of pc.orients) for(const t of placeCands(o.V,pc.tgt,Ws)){
+        const W=shift(o.V,t[0],t[1]);
+        if(!inConvex(W,P)) continue;
+        const ck=t[0].toFixed(3)+','+t[1].toFixed(3)+o.key; if(seen.has(ck)) continue; seen.add(ck);
+        if(!fitsAmong(W,Ws)) continue;
+        const r=rec(Ws.concat([W]), ids.concat([pc.i+'@'+avg(W).map(v=>v.toFixed(3)).join(',')+o.key]), left.filter(x=>x!==pc));
+        if(r) return [{pc,W}].concat(r);
+        if(timeout) return null;
+      }
+    }
+    memo.add(key); return null;
+  };
+  const sol=rec(fixed.map(o=>o.wv), fixed.map(o=>o.i+'@'+avg(o.wv).map(v=>v.toFixed(3)).join(',')+'fixed'), pieces.filter(o=>!o.placed));
+  return {sol, timeout, ms:performance.now()-t0};
+}
 function clearHint(){ clearTimeout(hintTimer); if(layers.hint) layers.hint.innerHTML=''; pieces.forEach(p=>p.g.classList.remove('pulse')); }
 function giveHint(){
   if(phase!=='play'||hintLeft()>0) return;
-  const free=pieces.filter(p=>p.slot<0); if(!free.length) return;
+  const free=pieces.filter(p=>!p.placed); if(!free.length) return;
   clearHint();
-  const pc=(selected&&selected.slot<0)?selected:(free.find(p=>slotOwner[p.i]===-1)||free[0]);
-  const j=(slotOwner[pc.i]===-1&&pc.compat.includes(pc.i))?pc.i:pc.compat.find(k=>slotOwner[k]===-1);
-  if(j===undefined) return;
+  const res=solveFrom();
+  if(!res.sol){
+    if(res.timeout) toast('지금 배치로는 힌트를 찾지 못했어요. 조각 몇 개를 다시 빼 보세요.',2800);
+    else toast('지금 놓인 조각으로는 완성할 수 없어요. 조각 몇 개를 다시 빼 보세요.',3000);
+    return;                                   // 힌트를 주지 못했으니 벌점·대기 없음
+  }
+  const pick=res.sol.find(s=>s.pc===selected)||res.sol[0], pc=pick.pc;
   hintCount++; updateHintLbl();
   hintReadyAt=performance.now()+HINT_COOLDOWN*1000;
   if(mode==='challenge'){ levelPenalty+=HINT_PENALTY; const c=$('clock'); c.classList.remove('pen'); void c.offsetWidth; c.classList.add('pen'); SFX.penalty(); toast(`힌트 사용: 기록 +${HINT_PENALTY}초`); }
-  el('polygon',{points:pts(slots[j]),class:'slot hint'},layers.hint);
+  el('polygon',{points:pts(pick.W),class:'slot hint'},layers.hint);
   pc.g.classList.add('pulse');
   hintTimer=setTimeout(clearHint,3500);
 }
